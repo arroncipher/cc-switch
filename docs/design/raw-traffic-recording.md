@@ -1,5 +1,7 @@
 # CC Switch 原始流量录制与导出设计
 
+[FIX 2026-10-25-01] Native installer validation and bounded Step 4 implementation repair; approved feature interfaces and module decomposition remain fixed.
+
 状态：Phase 1 已于 2026-10-24 获用户“继续，并完成测试”授权；按同一外部契约继续内部设计、实现与验证。本文件是唯一设计文档。
 
 源码基线：`farion1231/cc-switch` 的 `main`，提交 `309c9c5154e6d7f19b64ab4da6041da323ff9a42`。
@@ -412,3 +414,21 @@ The local Node version is 25.9.0. Its experimental global Web Storage changes th
 ### Validation limits
 
 Validated on macOS with Rust 1.95.0 and the repository's pinned pnpm 10.12.3. Windows/Linux execution, a signed desktop installer and a manual graphical smoke test were not performed. Recording is restricted to traffic actually traversing the local proxy. Exact bodies can contain private data, and slow/full disks require user attention; there is no automatic retention cleanup or content-analysis dashboard.
+
+## [FIX 2026-10-25-01] macOS installer validation and export-dialog repair
+
+[FIX 2026-10-25-01] Bug / earliest broken step: native macOS validation showed the shared `save_file_dialog` implementation in `src-tauri/src/commands/import_export.rs` always selected SQL. Traffic export therefore proposed `.zip.sql`. This is a Step 4 implementation defect under the existing ZIP-export contract; the public command signatures, feature scope and module boundaries stay unchanged.
+
+[FIX 2026-10-25-01] Repair: the existing command selects the ZIP filter for a `.zip` default filename and preserves the SQL filter for SQL backups. A new regression test first failed against the SQL-only implementation, then passed for lowercase/uppercase ZIP and SQL backup names. No new command or frontend API was added.
+
+[FIX 2026-10-25-01] Test correction: the original OAuth `replacement_closes_the_previous_keep_alive_connection` test failed twice in optimized builds because reqwest reused an idle connection while the previous server's FIN was arriving. The test now keeps an explicit Hyper connection alive, awaits server-side closure, and then checks the new callback with a fresh client connection. OAuth production behavior is unchanged; the assertion is stronger and no sleep or skipped test was introduced.
+
+[FIX 2026-10-25-01] Build: a release-optimized Apple Silicon `.app` named **CC Switch Raw Traffic**, bundle ID `com.arroncipher.ccswitch.rawtraffic`, was ad-hoc signed and packaged into a compressed DMG. The original Tauri DMG decoration script failed while waiting for Finder automation; a standard `hdiutil create -format UDZO` image with an Applications link was generated instead. Image verification, read-only mount, clean install copy, arm64 inspection and strict code-signature verification all passed. Apple notarization was not performed.
+
+[FIX 2026-10-25-01] Installed-app validation: launched the app copied from the final DMG with an isolated `CC_SWITCH_TEST_HOME`; started its proxy from the native UI; verified default-off creates no records; enabled recording from the native UI; verified the setting and old recordings survived quit/reinstall/relaunch; exercised JSON, gzip, fragmented SSE and HTTP 401 before and after restart. Eight requests produced 32 body files matching the client and upstream bytes, sizes and hashes. Header credential redaction and complete outcomes were checked.
+
+[FIX 2026-10-25-01] Export validation: the corrected native Save dialog showed `.zip`, saved a real ZIP and displayed eight requests with zero incomplete. All 32 exported bodies and SHA-256 checksums matched the local originals. Cancelling the native folder picker left the configured folder unchanged. A visual smoke check confirmed the recording panel and success message rendered correctly. These checks supersede the earlier receipt's macOS installer and manual-GUI limitations; Windows/Linux remain untested.
+
+[FIX 2026-10-25-01] Automated regression: `cargo +stable test --lib` passed **4059**, failed **0**, ignored **11** existing tests. `cargo +stable test --release --lib` passed **4059**, failed **0**, ignored **11**. The traffic panel, settings integration and import/export hook tests passed **29/29** across three files. Rust formatting, `git diff --check` and `cargo +stable clippy -- -D warnings` passed. The recorder source is unchanged, so its previously measured production coverage remains 94.91%.
+
+[FIX 2026-10-25-01] Artifacts: `CC-Switch-Raw-Traffic-4.0.19-macOS-arm64.dmg`, `SHA256SUMS.txt`, a test-only `sample-traffic.zip`, and a verification report are saved outside the repository under this task's `artifacts/cc-switch-raw-traffic/` directory. Original installed CC Switch was not replaced by the test workflow, and no real model API was used.
