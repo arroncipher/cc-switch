@@ -33,6 +33,8 @@ pub mod thinking_budget_rectifier;
 pub mod thinking_optimizer;
 pub mod thinking_rectifier;
 pub(crate) mod tool_media;
+#[path = "traffic_recorder/traffic_recorder.rs"]
+pub mod traffic_recorder;
 pub(crate) mod types;
 pub mod usage;
 

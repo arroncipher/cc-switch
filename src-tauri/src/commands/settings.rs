@@ -51,6 +51,7 @@ fn merge_settings_for_save(
     // 客户端地址只经 set_proxy_client_host 保存（它还要重写客户端）；全量保存带的是前端
     // 缓存里的旧值，透传会把刚保存的地址冲掉。
     incoming.proxy_client_host = existing.proxy_client_host.clone();
+    incoming.traffic_recording = existing.traffic_recording.clone();
     incoming
 }
 
@@ -406,6 +407,17 @@ mod tests {
         CodexThirdPartyHistoryProviderBucketMigration, LocalMigrations, S3SyncSettings,
         WebDavSyncSettings,
     };
+
+    #[test]
+    fn raw_traffic_settings_default_off_and_survive_stale_frontend_save() {
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!old.traffic_recording.enabled);
+        let mut existing = AppSettings::default();
+        existing.traffic_recording.enabled = true;
+        existing.traffic_recording.directory = Some(std::path::PathBuf::from("/fixture"));
+        let merged = merge_settings_for_save(old, &existing);
+        assert_eq!(merged.traffic_recording, existing.traffic_recording);
+    }
 
     #[test]
     fn save_settings_should_keep_the_existing_proxy_client_host() {

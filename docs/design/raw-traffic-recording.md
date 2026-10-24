@@ -1,6 +1,6 @@
 # CC Switch 原始流量录制与导出设计
 
-状态：Step 1 / Phase 1，待用户审阅；本文件是唯一设计审批对象。
+状态：Phase 1 已于 2026-10-24 获用户“继续，并完成测试”授权；按同一外部契约继续内部设计、实现与验证。本文件是唯一设计文档。
 
 源码基线：`farion1231/cc-switch` 的 `main`，提交 `309c9c5154e6d7f19b64ab4da6041da323ff9a42`。
 
@@ -296,3 +296,119 @@ flowchart TD
 - 当前阶段只提交设计文档，不伪装为已实现功能。
 - 先查询已有上游 Issue 并准备相应功能说明；上游规范要求功能 PR 有关联 Issue。
 - 实现完成后遵循仓库 PR 模板，附实际测试结果；不自动合并。
+
+### Phase 2 Internal Design
+
+#### Data Flow
+
+1. `ProxyService` 延迟创建共享录制器，代理启动时注入 `ProxyState`；未启用时不创建归档目录。设置保存使用专用命令并保护全量设置合并。
+2. `server.rs` 在 Router 前后包裹 HTTP body frame，保留数据帧和 trailer，逐块录制客户端正文。通过 request extensions 携带录制器、原始 `CaptureMetadata` 和请求级原子尝试计数器，不改变客户端请求头。
+3. `forwarder.rs` 每次实际发送前分配 attempt，写入最终发送字节；Hyper 和 Reqwest 共用这一边界。收到响应后立即将其包装成原始字节流，在任何状态检查、解压、协议转换和重试前录制。
+4. `TrafficCapture` 独占正文句柄，顺序写入并计算 SHA-256。begin 时清单已是未完成，finish 在刷盘后原子更新清单；Drop/退出保留 interrupted 状态。
+5. 导出先获取已写入字节和清单的一致快照，再复制限定字节范围、生成索引和 ZIP。进行中的记录使用部分状态，禁止把之后追加的数据混入快照。
+
+#### Thread Model
+
+代理沿用 Tokio。录制模块全部常规文件操作经 `spawn_blocking`，写入调用等待该块落到操作系统文件层，保证有界流动和顺序，不用无界队列，也不在请求运行时线程直接做常规文件 I/O。共享状态的互斥锁只保护文件操作和清单快照。导出的 ZIP 压缩在快照之后独立执行。捕获错误被边界接入隔离，不替换 HTTP 结果。无 runtime 的 Drop 收尾允许同步落下中断状态。
+
+#### Thread Diagram
+
+```mermaid
+flowchart LR
+    Proxy[Tokio HTTP body poll] --> IO[spawn_blocking：追加正文与元数据]
+    IO --> Proxy
+    Commands[设置与导出命令] --> Snapshot[spawn_blocking：清单与文件长度快照]
+    Snapshot --> ZIP[spawn_blocking：限定范围复制与 ZIP]
+```
+
+#### Init Code Skeletons
+
+```rust
+// src-tauri/src/services/proxy.rs：只在实际需要时初始化，共享给当前代理实例。
+let recorder = self.traffic_recorder.get_or_try_init(|| async {
+    TrafficRecorder::open(crate::settings::get_settings().traffic_recording)
+        .await.map(Arc::new)
+}).await?;
+let server = ProxyServer::new(config, db, app_handle)
+    .with_traffic_recorder(recorder.clone());
+```
+
+#### Public Function Pseudocode Supplements
+
+`src-tauri/src/proxy/traffic_recorder/traffic_recorder.rs`：
+
+```text
+TrafficRecorder.open: resolve device-local directory; validate enabled config; create empty owner state.
+TrafficRecorder.reconfigure: validate new directory before publishing config; preserve existing capture paths.
+TrafficRecorder.begin: validate generated UUID and stage/attempt; create body exclusively; persist incomplete manifest; return owned capture.
+TrafficRecorder.export: snapshot manifests and written byte lengths; reject symlinks/unsafe paths/self-export/overwrite; copy snapshot bytes; produce JSONL and atomically publish ZIP.
+TrafficRecorder.shutdown: reject new captures; flush active bodies and mark interrupted; retain completed data.
+TrafficCapture.write: append bytes in order; update count/hash; report disk failure without changing the network stream.
+TrafficCapture.finish: flush/sync body; save outcome, size and hash; atomically update manifest; consume handle.
+```
+
+`src-tauri/src/commands/traffic_recording.rs`：设置命令先验证/应用再持久化，持久化失败回滚；导出命令只转发给服务并返回结构化结果。
+
+## Test Strategy
+
+优先覆盖原文保真和失败可见性，再覆盖设置和导出操作；不把模型回答质量作为测试目标。Mock 先验证断行、UTF-8、二进制和预期导出契约，实际实现完成后用同一批数据验证文件与网络两侧逐字节一致。
+
+### End-to-End Flow Coverage
+
+本地假上游 → 现有 ProxyServer → 客户端；覆盖普通响应、SSE、401/500、重试、gzip、客户端提前断开和录制目录不可写。关闭录制时现有响应不变且无归档目录。开启时验证客户端与上游四个边界、全部 attempt、ZIP 正文和 manifest 的 SHA-256。
+
+### Module Test Matrix
+
+| 边界 | 测试位置 | 检查内容 |
+| --- | --- | --- |
+| open / reconfigure | `traffic_recorder/traffic_recorder.rs` 内部测试 | 默认关闭、非法目录、旧录制继续原目录、已有数据保留 |
+| begin / write / finish | 同上 | 原始 JSON 空白、分片 UTF-8、SSE 注释/CRLF/尾片、二进制、空正文、重试独立、超预览大小 |
+| 失败与生命周期 | 同上及 `proxy/server.rs` 内部测试 | Drop、shutdown、读流失败、写盘失败不改变 HTTP、未出现的响应不伪造 |
+| export | 录制器内部测试 | JSONL/ZIP/hash 一致、进行中快照、跨日保留、拒绝覆盖、自包含路径、symlink/路径穿越 |
+| Settings / Commands | `commands/settings.rs` 现有测试与新命令测试 | 缺失字段默认关闭、旧缓存不能覆盖录制设置、失败回滚 |
+| UI | `tests/components/TrafficRecordingSection.test.tsx` | 开关、目录选择、保存/导出失败、取消操作、调用参数 |
+
+### Test Cases
+
+按上述数据流逐项实现测试；Rust 新录制模块的行覆盖率目标至少 70%。仓库规定检查为 TypeScript 类型检查、前端格式、前端单测、前端构建，以及 Rust 格式、Clippy 和后端测试。所有后端测试指定 `CC_SWITCH_TEST_HOME` 到本轮临时目录，避免接触真实客户端配置。
+
+## Implementation and verification receipt — 2026-10-25
+
+### Delivered behavior
+
+- Device-local opt-in settings and a dedicated Settings → Data panel; English, Simplified/Traditional Chinese, Japanese and Turkish labels are included.
+- Four independently stored HTTP body boundaries, correlated by UUID, with separate numbered upstream attempts. Existing handler extensions and `ProxyResponse::bytes_stream` already provide the required handoff, so no additional handler-context or hyper-client production changes were necessary.
+- JSON whitespace, binary/compressed bodies and SSE delimiters/comments/fragmented UTF-8 remain original bytes. HTTP transfer framing, original header casing, TLS packets and chunk timing are outside the body-recording contract.
+- File writes run on blocking workers with awaited backpressure, without an unbounded chunk queue. Files are retained until manually removed. Existing captures keep their original file paths when the configured folder changes; export scans the currently selected folder.
+- Manifests begin incomplete and finalize with size, SHA-256 and outcome. HTTP bodies that signal end-of-stream on their last frame finalize before returning that frame, including empty bodies that Hyper may never poll. Dropped or failed streams remain incomplete.
+- ZIP export snapshots the observed prefix, includes raw bodies, manifests and `index.jsonl`, rejects overwrite/self-export/path traversal/symlinks, and verifies completed bodies against their recorded hashes. Metadata credentials are redacted; bodies intentionally are not.
+- Dedicated configuration updates preserve the setting against stale general-settings saves. Invalid configuration does not replace the current recorder configuration; persistence failures attempt rollback. Proxy startup disables an unavailable recorder, and recording errors do not fail an HTTP request.
+
+### Executed checks
+
+All backend commands used a dedicated `CC_SWITCH_TEST_HOME`; no real CLI configurations were used. Network fixtures bind only to loopback and use no real model APIs.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| TypeScript | `pnpm typecheck` | Passed |
+| Frontend format | `pnpm format:check` | Passed |
+| Frontend tests | `TZ=Etc/GMT+12 NODE_OPTIONS=--no-experimental-webstorage pnpm exec vitest run` | 256 files, 3301 tests passed |
+| Frontend production build | `pnpm build:renderer` | Passed; existing bundle-size advisory remains |
+| Rust format | `cargo +stable fmt --check` | Passed |
+| Rust lint | `cargo +stable clippy -- -D warnings` | Passed |
+| Rust full suite | `cargo +stable test` with inherited proxy environment variables unset | 18 test binaries, 4266 passed, 0 failed, 11 existing ignored tests |
+| Recorder coverage | `cargo +stable llvm-cov test --lib --no-report traffic_recorder`, then `cargo +stable llvm-cov report --lcov` | 7 recorder tests passed; production-only lines 541/570 = **94.91%**, excluding the `#[cfg(test)]` section |
+
+The local Node version is 25.9.0. Its experimental global Web Storage changes the existing test harness's storage behavior, so it was disabled for the final frontend suite. An unrelated session-list test assumes that a timestamp one hour ago is still “today”; the full suite was run in a timezone where that fixture remains within the current day. No unrelated production code or tests were changed for these environment issues.
+
+### Feature-specific evidence
+
+- Seven recorder tests cover default-off/no-directory behavior; configuration validation; exact JSON/SSE/binary content; repeated-header redaction; SHA-256/ZIP/index agreement; 51 MiB chunked content; duplicate boundaries and attempt validation; read/write/drop/shutdown failure states; directory changes; active-prefix export; tamper detection; private Unix permissions; unsafe paths, symlinks and schemas.
+- A real loopback proxy test compares all four recorded boundaries against what the client sent/received and what the mock upstream received/sent, including gzip, SSE and HTTP 401. Replacing the recording folder with a regular file verifies that a recording failure leaves the HTTP response successful and unchanged.
+- A real upstream failover test preserves HTTP 500 from the first provider and HTTP 200 from the second provider as separate attempts, verifying request payloads, provider identity, status and completion.
+- Body-stream tests verify first-frame delivery and persistence before EOF, trailer preservation, read errors and interruption on dropping an unfinished body.
+- Settings regression test verifies backward-compatible default-off and stale-save protection; six UI tests cover toggling, failure rollback, directory selection/cancellation, ZIP selection/cancellation and error reporting.
+
+### Validation limits
+
+Validated on macOS with Rust 1.95.0 and the repository's pinned pnpm 10.12.3. Windows/Linux execution, a signed desktop installer and a manual graphical smoke test were not performed. Recording is restricted to traffic actually traversing the local proxy. Exact bodies can contain private data, and slow/full disks require user attention; there is no automatic retention cleanup or content-analysis dashboard.

@@ -39,6 +39,7 @@ import { AboutSection } from "@/components/settings/AboutSection";
 import { RoutingSection } from "@/components/settings/sections/RoutingSection";
 import { GlobalProxySettings } from "@/components/settings/GlobalProxySettings";
 import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
+import { TrafficRecordingSection } from "@/components/settings/TrafficRecordingSection";
 import { GeneralSection } from "@/components/settings/sections/GeneralSection";
 import { AppConfigSection } from "@/components/settings/sections/AppConfigSection";
 import {
@@ -517,6 +518,11 @@ export function SettingsPage({
             >
               <div className="rounded-panel border border-border bg-surface p-5">
                 <LogConfigPanel />
+              </div>
+            </SettingsBlock>
+            <SettingsBlock title={t("settings.trafficRecording.title")}>
+              <div className="rounded-panel border border-border bg-surface p-5">
+                <TrafficRecordingSection />
               </div>
             </SettingsBlock>
           </>

@@ -402,6 +402,18 @@
     }
   },
   "settings": {
+    "trafficRecording": {
+      "title": "Raw traffic recording",
+      "enabled": "Save requests and responses locally",
+      "description": "Off by default. Saves original request and response bodies, including SSE, prompts, tool data and images. Only header and URL credentials are redacted. Files stay on this device; manage disk space manually.",
+      "defaultDirectory": "Default: CC Switch data directory / raw-traffic",
+      "chooseDirectory": "Choose folder",
+      "openDirectory": "Open folder",
+      "export": "Export ZIP",
+      "exported": "Traffic exported",
+      "exportSummary": "{{count}} requests; {{incomplete}} incomplete.",
+      "failed": "Traffic recording operation failed"
+    },
     "title": "Settings",
     "general": {
       "appearance": "Appearance",

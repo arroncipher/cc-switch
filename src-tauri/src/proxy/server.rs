@@ -8,6 +8,9 @@
 //! the hyper-based HTTP client, producing wire-level header casing identical to
 //! a direct (non-proxied) CLI request.
 
+use super::traffic_recorder::{
+    CaptureMetadata, CaptureOutcome, CaptureStage, TrafficCapture, TrafficRecorder,
+};
 use super::{
     failover_switch::FailoverSwitchManager,
     handlers,
@@ -23,8 +26,11 @@ use axum::{
     routing::{any, get, post},
     Router,
 };
+use http_body_util::BodyExt;
+use hyper::body::Body as _;
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tokio::task::JoinHandle;
@@ -32,6 +38,7 @@ use tokio::task::JoinHandle;
 /// 代理服务器状态（共享）
 #[derive(Clone)]
 pub struct ProxyState {
+    pub(crate) traffic_recorder: Option<Arc<TrafficRecorder>>,
     pub db: Arc<Database>,
     pub config: Arc<RwLock<ProxyConfig>>,
     pub status: Arc<RwLock<ProxyStatus>>,
@@ -79,6 +86,7 @@ impl ProxyServer {
         let failover_manager = Arc::new(FailoverSwitchManager::new());
 
         let state = ProxyState {
+            traffic_recorder: None,
             db,
             config: Arc::new(RwLock::new(config.clone())),
             status: Arc::new(RwLock::new(ProxyStatus::default())),
@@ -97,6 +105,11 @@ impl ProxyServer {
             shutdown_tx: Arc::new(RwLock::new(None)),
             server_handle: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub(crate) fn with_traffic_recorder(mut self, recorder: Arc<TrafficRecorder>) -> Self {
+        self.state.traffic_recorder = Some(recorder);
+        self
     }
 
     pub async fn start(&self) -> Result<ProxyServerInfo, ProxyError> {
@@ -161,6 +174,7 @@ impl ProxyServer {
                         };
 
                         let app = app.clone();
+                        let recorder = state.traffic_recorder.clone();
                         tokio::spawn(async move {
                             // Peek raw TCP bytes to capture original header casing
                             // before hyper parses (and lowercases) the header names.
@@ -186,6 +200,7 @@ impl ProxyServer {
                             let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                                 let mut router = app.clone();
                                 let cases = original_cases.clone();
+                                let recorder = recorder.clone();
                                 async move {
                                     // 将 hyper::body::Incoming 转为 axum::body::Body，保留 extensions
                                     let (mut parts, body) = req.into_parts();
@@ -193,9 +208,37 @@ impl ProxyServer {
                                     // Insert our own header case map alongside hyper's internal one
                                     parts.extensions.insert(cases);
 
-                                    let body = axum::body::Body::new(body);
+                                    let mut body = axum::body::Body::new(body);
+                                    let recording = if !matches!(parts.uri.path(), "/health" | "/status") {
+                                        if let Some(recorder) = recorder {
+                                            let meta = CaptureMetadata {
+                                                request_id: uuid::Uuid::new_v4().to_string(),
+                                                started_at: chrono::Local::now(),
+                                                attempt: None,
+                                                stage: CaptureStage::ClientRequest,
+                                                app_type: None,
+                                                provider_id: None,
+                                                method: Some(parts.method.to_string()),
+                                                url: Some(parts.uri.to_string()),
+                                                status: None,
+                                                headers: parts.headers.clone(),
+                                            };
+                                            let capture = begin_capture(&recorder, meta.clone()).await;
+                                            body = record_client_body(body, capture).await;
+                                            parts.extensions.insert((recorder.clone(), meta.clone(), Arc::new(AtomicU32::new(0))));
+                                            Some((recorder, meta))
+                                        } else { None }
+                                    } else { None };
                                     let axum_req = http::Request::from_parts(parts, body);
-                                    <Router as tower::Service<http::Request<axum::body::Body>>>::call(&mut router, axum_req).await
+                                    let response = <Router as tower::Service<http::Request<axum::body::Body>>>::call(&mut router, axum_req).await?;
+                                    if let Some((recorder, mut meta)) = recording {
+                                        let (parts, body) = response.into_parts();
+                                        meta.stage = CaptureStage::ClientResponse;
+                                        meta.status = Some(parts.status.as_u16());
+                                        meta.headers = parts.headers.clone();
+                                        let capture = begin_capture(&recorder, meta).await;
+                                        Ok::<_, std::convert::Infallible>(http::Response::from_parts(parts, record_client_body(body, capture).await))
+                                    } else { Ok(response) }
                                 }
                             });
 
@@ -459,6 +502,72 @@ impl ProxyServer {
     }
 }
 
+async fn begin_capture(
+    recorder: &TrafficRecorder,
+    meta: CaptureMetadata,
+) -> Option<TrafficCapture> {
+    match recorder.begin(meta).await {
+        Ok(capture) => capture,
+        Err(e) => {
+            log::warn!("Raw traffic recording unavailable: {e}");
+            None
+        }
+    }
+}
+
+async fn record_client_body(
+    mut body: axum::body::Body,
+    mut capture: Option<TrafficCapture>,
+) -> axum::body::Body {
+    if capture.is_none() {
+        return body;
+    }
+    // Hyper may not poll empty bodies, or poll again after the final data frame.
+    if body.is_end_stream() {
+        if let Some(active) = capture.take() {
+            if let Err(e) = active.finish(CaptureOutcome::Complete).await {
+                log::warn!("Raw traffic recording incomplete: {e}");
+            }
+        }
+        return body;
+    }
+    let stream = async_stream::stream! {
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(frame) => {
+                    if let (Some(bytes), Some(active)) = (frame.data_ref(), capture.as_mut()) {
+                        if let Err(e) = active.write(bytes.clone()).await {
+                            log::warn!("Raw traffic recording incomplete: {e}");
+                            capture.take();
+                        }
+                    }
+                    if body.is_end_stream() {
+                        if let Some(active) = capture.take() {
+                            if let Err(e) = active.finish(CaptureOutcome::Complete).await {
+                                log::warn!("Raw traffic recording incomplete: {e}");
+                            }
+                        }
+                    }
+                    yield Ok::<_, axum::Error>(frame);
+                }
+                Err(e) => {
+                    if let Some(active) = capture.take() {
+                        let _ = active.finish(CaptureOutcome::ReadFailed { reason: e.to_string() }).await;
+                    }
+                    yield Err(e);
+                    return;
+                }
+            }
+        }
+        if let Some(active) = capture.take() {
+            if let Err(e) = active.finish(CaptureOutcome::Complete).await {
+                log::warn!("Raw traffic recording incomplete: {e}");
+            }
+        }
+    };
+    axum::body::Body::new(http_body_util::StreamBody::new(stream))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +582,319 @@ mod tests {
         path_and_query: String,
         authorization: Option<String>,
         body: Value,
+    }
+
+    #[tokio::test]
+    async fn raw_traffic_streams_before_eof_preserves_trailers_and_marks_read_error() {
+        use crate::proxy::traffic_recorder::TrafficRecordingConfig;
+        use bytes::Bytes;
+        use hyper::body::Frame;
+        let temp = tempfile::tempdir().unwrap();
+        let recorder = TrafficRecorder::open(TrafficRecordingConfig {
+            enabled: true,
+            directory: Some(temp.path().into()),
+        })
+        .await
+        .unwrap();
+        let mut meta = CaptureMetadata {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            started_at: chrono::Local::now(),
+            stage: CaptureStage::ClientResponse,
+            attempt: None,
+            app_type: None,
+            provider_id: None,
+            method: None,
+            url: None,
+            status: Some(200),
+            headers: HeaderMap::new(),
+        };
+        let dir = temp
+            .path()
+            .join(meta.started_at.format("%Y-%m-%d").to_string())
+            .join(&meta.request_id);
+        let cap = recorder.begin(meta.clone()).await.unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-trailer", "preserved".parse().unwrap());
+        let stream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(Frame::data(Bytes::from_static(b": first\r\n\r\n")));
+            wait.await.unwrap();
+            yield Ok(Frame::trailers(trailers));
+        };
+        let mut body = record_client_body(
+            axum::body::Body::new(http_body_util::StreamBody::new(stream)),
+            cap,
+        )
+        .await;
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.data_ref().unwrap(), b": first\r\n\r\n".as_slice());
+        assert_eq!(
+            std::fs::read(dir.join("client/response.body")).unwrap(),
+            b": first\r\n\r\n"
+        );
+        release.send(()).unwrap();
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(frame.trailers_ref().unwrap()["x-trailer"], "preserved");
+        assert!(body.frame().await.is_none());
+        let read_manifest = || -> Value {
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap()
+        };
+        assert_eq!(
+            read_manifest()["parts"]["client/response"]["outcome"]["kind"],
+            "complete"
+        );
+        meta.stage = CaptureStage::ClientRequest;
+        let cap = recorder.begin(meta.clone()).await.unwrap();
+        let stream = futures::stream::iter([
+            Ok(Bytes::from_static(b"partial")),
+            Err(std::io::Error::other("fixture reset")),
+        ]);
+        let mut body = record_client_body(axum::body::Body::from_stream(stream), cap).await;
+        assert!(body.frame().await.unwrap().is_ok());
+        assert!(body.frame().await.unwrap().is_err());
+        assert_eq!(
+            read_manifest()["parts"]["client/request"]["outcome"]["kind"],
+            "readFailed"
+        );
+        // Dropping an unfinished stream must never be marked complete.
+        meta.stage = CaptureStage::UpstreamResponse;
+        meta.attempt = Some(1);
+        let cap = recorder.begin(meta).await.unwrap();
+        let stream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"partial upstream"));
+            std::future::pending::<()>().await;
+        };
+        let mut body = record_client_body(axum::body::Body::from_stream(stream), cap).await;
+        assert!(body.frame().await.unwrap().is_ok());
+        drop(body);
+        recorder.shutdown().await.unwrap();
+        assert_eq!(
+            read_manifest()["parts"]["attempts/000001/response"]["outcome"]["kind"],
+            "interrupted"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_traffic_records_real_proxy_boundaries_and_keeps_http_working_on_disk_failure() {
+        use crate::proxy::traffic_recorder::TrafficRecordingConfig;
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("recordings");
+        let recorder = Arc::new(
+            TrafficRecorder::open(TrafficRecordingConfig {
+                enabled: true,
+                directory: Some(root.clone()),
+            })
+            .await
+            .unwrap(),
+        );
+        let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let json_response =
+            b" {\"created\":1,\"data\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}} \n";
+        let sse = b": keepalive\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\r\n\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\r\n\r\ndata: [DONE]\n\n";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(json_response).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let captured = received.clone();
+        let gzip = compressed.clone();
+        let mock = Router::new().fallback(move |request: axum::extract::Request| {
+            let received = captured.clone();
+            let gzip = gzip.clone();
+            async move {
+                let path = request.uri().path().to_string();
+                let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                received.lock().await.push(body.to_vec());
+                if path.ends_with("responses") {
+                    let stream = async_stream::stream! {
+                        for chunk in sse.chunks(7) {
+                            yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(chunk));
+                            tokio::task::yield_now().await;
+                        }
+                    };
+                    http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from_stream(stream))
+                        .unwrap()
+                } else if path.contains("edits") {
+                    http::Response::builder()
+                        .header("content-type", "application/json")
+                        .header("content-encoding", "gzip")
+                        .body(axum::body::Body::from(gzip))
+                        .unwrap()
+                } else if path.contains("search") {
+                    http::Response::builder()
+                        .status(401)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            "{\"error\":{\"message\":\"fixture denied\"}}",
+                        ))
+                        .unwrap()
+                } else {
+                    http::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(json_response.as_slice()))
+                        .unwrap()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock_handle = tokio::spawn(async move {
+            axum::serve(listener, mock).await.unwrap();
+        });
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = Provider::with_id(
+            "raw-fixture".into(),
+            "raw fixture".into(),
+            json!({
+                "base_url":format!("http://{addr}"), "auth":{"OPENAI_API_KEY":"upstream-secret"}
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        db.set_current_provider("codex", &provider.id).unwrap();
+        let proxy = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                non_streaming_timeout: 10,
+                ..ProxyConfig::default()
+            },
+            db,
+            None,
+        )
+        .with_traffic_recorder(recorder.clone());
+        let info = proxy.start().await.unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let payload =
+            " { \"model\": \"gpt-5\", \"input\": \"原始 body\", \"prompt\": \"fixture\" } \n";
+        let mut actual = Vec::new();
+        for path in [
+            "/v1/images/generations",
+            "/v1/images/edits",
+            "/v1/responses",
+            "/v1/alpha/search",
+        ] {
+            let body = if path.ends_with("responses") {
+                payload.replace("\"model\"", "\"stream\":true, \"model\"")
+            } else {
+                payload.into()
+            };
+            let response = client
+                .post(format!("http://127.0.0.1:{}{path}", info.port))
+                .header("authorization", "Bearer client-secret")
+                .header("content-type", "application/json")
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = response.bytes().await.unwrap();
+            if path.contains("search") {
+                assert_eq!(status.as_u16(), 401);
+            } else {
+                assert!(
+                    status.is_success(),
+                    "{path}: status={status}, body={bytes:?}, upstream={:?}",
+                    received.lock().await
+                );
+            }
+            actual.push((body.into_bytes(), bytes.to_vec()));
+        }
+        // Await server-side EOF finalization before checking the committed manifests.
+        let export = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let target = temp.path().join(format!("{}.zip", uuid::Uuid::new_v4()));
+                let result = recorder.export(target).await.unwrap();
+                if result.request_count == 4 && result.incomplete_count == 0 {
+                    break result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recordings finalized");
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(export.path).unwrap()).unwrap();
+        let mut index = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name("index.jsonl").unwrap(), &mut index)
+            .unwrap();
+        let received = received.lock().await.clone();
+        assert_eq!(received.len(), 4);
+        for line in index.lines() {
+            let row: Value = serde_json::from_str(line).unwrap();
+            let prefix = row["directory"].as_str().unwrap();
+            let mut manifest = String::new();
+            std::io::Read::read_to_string(
+                &mut archive.by_name(&format!("{prefix}/manifest.json")).unwrap(),
+                &mut manifest,
+            )
+            .unwrap();
+            assert!(!manifest.contains("client-secret"));
+            assert!(!manifest.contains("upstream-secret"));
+            let manifest: Value = serde_json::from_str(&manifest).unwrap();
+            let parts = &manifest["parts"];
+            let url = parts["client/request"]["url"].as_str().unwrap();
+            let n = if url.contains("generations") {
+                0
+            } else if url.contains("edits") {
+                1
+            } else if url.contains("responses") {
+                2
+            } else {
+                3
+            };
+            for (key, expected) in [
+                ("client/request", actual[n].0.as_slice()),
+                ("client/response", actual[n].1.as_slice()),
+                ("attempts/000001/request", received[n].as_slice()),
+                (
+                    "attempts/000001/response",
+                    if n == 0 {
+                        json_response.as_slice()
+                    } else if n == 1 {
+                        &compressed
+                    } else if n == 2 {
+                        sse.as_slice()
+                    } else {
+                        b"{\"error\":{\"message\":\"fixture denied\"}}".as_slice()
+                    },
+                ),
+            ] {
+                let file = parts[key]["file"].as_str().unwrap();
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut archive.by_name(&format!("{prefix}/{file}")).unwrap(),
+                    &mut bytes,
+                )
+                .unwrap();
+                assert_eq!(bytes.as_slice(), expected, "{url} {key}");
+            }
+        }
+        // Make the recording root unwritable without affecting the upstream or proxy.
+        let previous = temp.path().join("previous");
+        std::fs::rename(&root, &previous).unwrap();
+        std::fs::write(&root, b"not a directory").unwrap();
+        let response = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/images/generations",
+                info.port
+            ))
+            .header("content-type", "application/json")
+            .body(payload)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(response.bytes().await.unwrap().as_ref(), json_response);
+        proxy.stop().await.unwrap();
+        recorder.shutdown().await.unwrap();
+        mock_handle.abort();
     }
 
     /// Windows 上监听 socket 不能被子进程继承：从 CC Switch 拉起的终端、CLI 一旦继承它，

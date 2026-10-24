@@ -402,6 +402,18 @@
     }
   },
   "settings": {
+    "trafficRecording": {
+      "title": "Ham trafik kaydı",
+      "enabled": "İstekleri ve yanıtları yerel olarak kaydet",
+      "description": "Varsayılan olarak kapalıdır. SSE, istemler, araç verileri ve resimler dahil özgün gövdeleri kaydeder. Yalnızca başlık ve URL kimlik bilgileri gizlenir. Dosyalar bu cihazda kalır; disk alanını elle yönetin.",
+      "defaultDirectory": "Varsayılan: CC Switch veri dizini / raw-traffic",
+      "chooseDirectory": "Klasör seç",
+      "openDirectory": "Klasörü aç",
+      "export": "ZIP dışa aktar",
+      "exported": "Trafik dışa aktarıldı",
+      "exportSummary": "{{count}} istek; {{incomplete}} eksik.",
+      "failed": "Trafik kaydı işlemi başarısız"
+    },
     "title": "Ayarlar",
     "general": {
       "appearance": "Görünüm",
