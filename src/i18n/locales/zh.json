@@ -405,7 +405,7 @@
     "trafficRecording": {
       "title": "原始流量录制",
       "enabled": "自动保存请求与响应",
-      "description": "默认关闭。保存原始请求、响应及 SSE，包含提示词、工具数据和图片。仅对请求头和网址凭据脱敏。文件保留在本机，请自行管理磁盘空间。",
+      "description": "默认关闭。按原始字节保存经过代理的请求/响应正文及 SSE，包含其中实际传输的提示词、工具数据、文件和图片。文件路径、文件 ID 或网址只保留引用，不额外复制、下载或拆分附件。仅对请求头和网址中的凭据脱敏。日志保存在本机，请自行管理磁盘空间。",
       "defaultDirectory": "默认：CC Switch 数据目录 / raw-traffic",
       "chooseDirectory": "选择目录",
       "openDirectory": "打开目录",

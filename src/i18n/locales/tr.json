@@ -405,7 +405,7 @@
     "trafficRecording": {
       "title": "Ham trafik kaydı",
       "enabled": "İstekleri ve yanıtları yerel olarak kaydet",
-      "description": "Varsayılan olarak kapalıdır. SSE, istemler, araç verileri ve resimler dahil özgün gövdeleri kaydeder. Yalnızca başlık ve URL kimlik bilgileri gizlenir. Dosyalar bu cihazda kalır; disk alanını elle yönetin.",
+      "description": "Varsayılan olarak kapalıdır. Proxy üzerinden geçen istek/yanıt gövdelerini ve SSE verilerini özgün baytlarıyla kaydeder; gövdede gerçekten taşınan istemler, araç verileri, dosyalar ve resimler buna dahildir. Dosya yolları, dosya kimlikleri ve URL’ler yalnızca başvuru olarak tutulur; ekler ayrıca kopyalanmaz, indirilmez veya ayıklanmaz. Yalnızca başlık ve URL kimlik bilgileri gizlenir. Günlükler bu cihazda kalır; disk alanını elle yönetin.",
       "defaultDirectory": "Varsayılan: CC Switch veri dizini / raw-traffic",
       "chooseDirectory": "Klasör seç",
       "openDirectory": "Klasörü aç",

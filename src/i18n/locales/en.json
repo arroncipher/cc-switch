@@ -405,7 +405,7 @@
     "trafficRecording": {
       "title": "Raw traffic recording",
       "enabled": "Save requests and responses locally",
-      "description": "Off by default. Saves original request and response bodies, including SSE, prompts, tool data and images. Only header and URL credentials are redacted. Files stay on this device; manage disk space manually.",
+      "description": "Off by default. Saves the original bytes of request/response bodies and SSE passing through the proxy, including prompts, tool data, files and images actually carried in the body. File paths, file IDs and URLs remain references; attachments are not copied, downloaded or extracted separately. Only credentials in headers and URLs are redacted. Logs stay on this device; manage disk space manually.",
       "defaultDirectory": "Default: CC Switch data directory / raw-traffic",
       "chooseDirectory": "Choose folder",
       "openDirectory": "Open folder",
