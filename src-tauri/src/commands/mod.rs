@@ -33,6 +33,7 @@ pub mod skill;
 mod stream_check;
 mod subscription;
 mod sync_support;
+mod traffic_recording;
 mod xai_oauth;
 
 mod lightweight;
@@ -73,6 +74,7 @@ pub use settings::*;
 pub use skill::*;
 pub use stream_check::*;
 pub use subscription::*;
+pub(crate) use traffic_recording::*;
 pub use xai_oauth::*;
 
 pub use lightweight::*;

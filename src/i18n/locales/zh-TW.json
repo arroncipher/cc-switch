@@ -402,6 +402,18 @@
     }
   },
   "settings": {
+    "trafficRecording": {
+      "title": "原始流量錄製",
+      "enabled": "自動儲存請求與回應",
+      "description": "預設關閉。以原始位元組儲存經過代理的請求/回應本文及 SSE，包含其中實際傳輸的提示詞、工具資料、檔案和圖片。檔案路徑、檔案 ID 或網址僅保留引用，不額外複製、下載或拆分附件。僅對標頭和網址中的憑證去識別化。日誌儲存在本機，請自行管理磁碟空間。",
+      "defaultDirectory": "預設：CC Switch 資料目錄 / raw-traffic",
+      "chooseDirectory": "選擇目錄",
+      "openDirectory": "開啟目錄",
+      "export": "匯出 ZIP",
+      "exported": "流量已匯出",
+      "exportSummary": "共 {{count}} 個請求，{{incomplete}} 個不完整。",
+      "failed": "流量錄製操作失敗"
+    },
     "title": "設定",
     "general": {
       "appearance": "外觀",

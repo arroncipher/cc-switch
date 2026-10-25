@@ -1551,6 +1551,9 @@ pub fn run() {
             commands::extract_common_config_snippet,
             commands::read_live_provider_settings,
             commands::get_settings,
+            commands::set_traffic_recording_config,
+            commands::export_traffic_recordings,
+            commands::open_traffic_recording_directory,
             commands::save_settings,
             commands::has_codex_unify_history_backup,
             commands::codex_forces_multi_agent_v2,
@@ -2039,6 +2042,7 @@ pub fn run() {
 pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
     if let Some(state) = app_handle.try_state::<store::AppState>() {
         crate::mode::controller::detach_all(state.inner()).await;
+        state.proxy_service.shutdown_traffic_recording().await;
         log::info!("退出清理完成：客户端已指回直连，代理已停止");
     }
 }

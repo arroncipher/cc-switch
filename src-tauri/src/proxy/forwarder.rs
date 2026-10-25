@@ -3,6 +3,9 @@
 //! 负责将请求转发到上游Provider，支持故障转移
 
 use super::hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES};
+use super::traffic_recorder::{
+    CaptureMetadata, CaptureOutcome, CaptureStage, TrafficCapture, TrafficRecorder,
+};
 use super::{
     body_filter::filter_private_params_with_whitelist,
     content_encoding::{decompress_body_with_limit, get_content_encoding},
@@ -41,6 +44,7 @@ use futures::StreamExt;
 use http::Extensions;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::RwLock;
@@ -2742,6 +2746,34 @@ impl RequestForwarder {
         );
 
         // 发送请求
+        let traffic = extensions
+            .get::<(Arc<TrafficRecorder>, CaptureMetadata, Arc<AtomicU32>)>()
+            .cloned()
+            .map(|(recorder, mut meta, attempts)| {
+                meta.attempt = Some(attempts.fetch_add(1, Ordering::Relaxed) + 1);
+                meta.stage = CaptureStage::UpstreamRequest;
+                meta.app_type = Some(app_type.as_str().into());
+                meta.provider_id = Some(provider.id.clone());
+                meta.method = Some(method.to_string());
+                meta.url = Some(url.clone());
+                meta.headers = ordered_headers.clone();
+                (recorder, meta)
+            });
+        if let Some((recorder, meta)) = &traffic {
+            if let Some(mut capture) = begin_upstream_capture(recorder, meta.clone()).await {
+                let result = capture.write(Bytes::copy_from_slice(&body_bytes)).await;
+                let outcome = match result {
+                    Ok(()) => CaptureOutcome::Complete,
+                    Err(e) => CaptureOutcome::RecordingFailed {
+                        reason: e.to_string(),
+                    },
+                };
+                if let Err(e) = capture.finish(outcome).await {
+                    log::warn!("Raw traffic recording incomplete: {e}");
+                }
+            }
+        }
+
         let response = if is_socks_proxy || !preserve_exact_header_case {
             // OpenAI / Copilot / Codex 类后端不依赖原始 header 大小写；走 reqwest
             // 连接池，避免 raw TCP/TLS path 每次请求都重新握手。SOCKS5 也只能走 reqwest。
@@ -2797,6 +2829,18 @@ impl RequestForwarder {
                 upstream_proxy_url.as_deref(),
             )
             .await?
+        };
+
+        let response = if let Some((recorder, mut meta)) = traffic {
+            meta.stage = CaptureStage::UpstreamResponse;
+            meta.headers = response.headers().clone();
+            meta.status = Some(response.status().as_u16());
+            match begin_upstream_capture(&recorder, meta).await {
+                Some(capture) => record_upstream_response(response, capture),
+                None => response,
+            }
+        } else {
+            response
         };
 
         // 检查响应状态
@@ -4550,6 +4594,55 @@ fn value_for_log(value: &Value) -> String {
         Value::Array(values) => format!("array(len={})", values.len()),
         Value::Object(values) => format!("object(len={})", values.len()),
     }
+}
+
+async fn begin_upstream_capture(
+    recorder: &TrafficRecorder,
+    meta: CaptureMetadata,
+) -> Option<TrafficCapture> {
+    match recorder.begin(meta).await {
+        Ok(capture) => capture,
+        Err(e) => {
+            log::warn!("Raw traffic recording unavailable: {e}");
+            None
+        }
+    }
+}
+
+fn record_upstream_response(response: ProxyResponse, capture: TrafficCapture) -> ProxyResponse {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let stream = response.bytes_stream();
+    let recorded = async_stream::stream! {
+        tokio::pin!(stream);
+        let mut capture = Some(capture);
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    if let Some(active) = capture.as_mut() {
+                        if let Err(e) = active.write(bytes.clone()).await {
+                            log::warn!("Raw traffic recording incomplete: {e}");
+                            capture.take();
+                        }
+                    }
+                    yield Ok(bytes);
+                }
+                Err(e) => {
+                    if let Some(active) = capture.take() {
+                        let _ = active.finish(CaptureOutcome::ReadFailed { reason: e.to_string() }).await;
+                    }
+                    yield Err(e);
+                    return;
+                }
+            }
+        }
+        if let Some(active) = capture.take() {
+            if let Err(e) = active.finish(CaptureOutcome::Complete).await {
+                log::warn!("Raw traffic recording incomplete: {e}");
+            }
+        }
+    };
+    ProxyResponse::streamed(status, headers, recorded)
 }
 
 #[cfg(test)]
@@ -8079,6 +8172,84 @@ mod tests {
             match result {
                 Ok(_) => panic!("expected the request to fail"),
                 Err(err) => err,
+            }
+        }
+
+        #[tokio::test]
+        async fn raw_traffic_keeps_failed_and_successful_failover_attempts() {
+            use crate::proxy::traffic_recorder::TrafficRecordingConfig;
+            let temp = tempfile::tempdir().unwrap();
+            let recorder = Arc::new(
+                TrafficRecorder::open(TrafficRecordingConfig {
+                    enabled: true,
+                    directory: Some(temp.path().join("recordings")),
+                })
+                .await
+                .unwrap(),
+            );
+            let meta = CaptureMetadata {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                started_at: chrono::Local::now(),
+                stage: CaptureStage::ClientRequest,
+                attempt: None,
+                app_type: None,
+                provider_id: None,
+                method: None,
+                url: None,
+                status: None,
+                headers: HeaderMap::new(),
+            };
+            let mut extensions = Extensions::new();
+            extensions.insert((recorder.clone(), meta.clone(), Arc::new(AtomicU32::new(0))));
+            let up1 = upstream(vec![error(500, "boom")]).await;
+            let up2 = upstream(vec![ok()]).await;
+            let fwd = forwarder(2, "p1");
+            let result = fwd
+                .forward_with_retry(
+                    &AppType::Claude,
+                    http::Method::POST,
+                    "/v1/messages",
+                    plain_body(),
+                    HeaderMap::new(),
+                    extensions,
+                    vec![provider("p1", &up1), provider("p2", &up2)],
+                )
+                .await
+                .ok()
+                .expect("failover succeeded");
+            assert_eq!(result.provider.id, "p2");
+            let body = result.response.bytes_with_limit(1024 * 1024).await.unwrap();
+            assert!(!body.is_empty());
+            let dir = temp
+                .path()
+                .join("recordings")
+                .join(meta.started_at.format("%Y-%m-%d").to_string())
+                .join(meta.request_id);
+            let manifest: Value =
+                serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+            for (attempt, provider_id, status) in [(1, "p1", 500), (2, "p2", 200)] {
+                let key = format!("attempts/{attempt:06}/response");
+                let part = &manifest["parts"][&key];
+                assert_eq!(part["status"], status);
+                assert_eq!(part["providerId"], provider_id);
+                assert_eq!(part["outcome"]["kind"], "complete");
+                assert!(!std::fs::read(dir.join(part["file"].as_str().unwrap()))
+                    .unwrap()
+                    .is_empty());
+                let key = format!("attempts/{attempt:06}/request");
+                let sent: Value = serde_json::from_slice(
+                    &std::fs::read(dir.join(manifest["parts"][&key]["file"].as_str().unwrap()))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    sent,
+                    if attempt == 1 {
+                        up1.requests.lock().await[0].clone()
+                    } else {
+                        up2.requests.lock().await[0].clone()
+                    }
+                );
             }
         }
 

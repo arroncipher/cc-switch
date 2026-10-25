@@ -4,6 +4,8 @@ import type {
   WebDavSyncSettings,
   S3SyncSettings,
   RemoteSnapshotInfo,
+  TrafficRecordingConfig,
+  TrafficExport,
 } from "@/types";
 import type { AppId } from "./types";
 
@@ -31,6 +33,19 @@ export interface WebDavSyncResult {
 }
 
 export const settingsApi = {
+  async setTrafficRecordingConfig(
+    config: TrafficRecordingConfig,
+  ): Promise<void> {
+    await invoke("set_traffic_recording_config", { config });
+  },
+
+  async exportTrafficRecordings(target: string): Promise<TrafficExport> {
+    return await invoke("export_traffic_recordings", { target });
+  },
+
+  async openTrafficRecordingDirectory(): Promise<void> {
+    await invoke("open_traffic_recording_directory");
+  },
   async get(): Promise<Settings> {
     return await invoke("get_settings");
   },

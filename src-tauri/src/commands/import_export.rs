@@ -96,6 +96,14 @@ pub async fn sync_current_providers_live(state: State<'_, AppState>) -> Result<V
 
 // ─── File dialogs ────────────────────────────────────────────
 
+fn save_dialog_filter(default_name: &str) -> (&'static str, &'static str) {
+    if default_name.to_ascii_lowercase().ends_with(".zip") {
+        ("ZIP", "zip")
+    } else {
+        ("SQL", "sql")
+    }
+}
+
 /// 保存文件对话框
 #[tauri::command]
 pub async fn save_file_dialog<R: tauri::Runtime>(
@@ -103,9 +111,10 @@ pub async fn save_file_dialog<R: tauri::Runtime>(
     #[allow(non_snake_case)] defaultName: String,
 ) -> Result<Option<String>, String> {
     let dialog = app.dialog();
+    let (label, extension) = save_dialog_filter(&defaultName);
     let result = dialog
         .file()
-        .add_filter("SQL", &["sql"])
+        .add_filter(label, &[extension])
         .set_file_name(&defaultName)
         .blocking_save_file();
 
@@ -242,6 +251,16 @@ pub async fn reveal_backup_location(id: String) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn traffic_zip_save_dialog_uses_zip_filter_and_preserves_sql_backups() {
+        assert_eq!(
+            super::save_dialog_filter("cc-switch-traffic-2026-10-25.zip"),
+            ("ZIP", "zip")
+        );
+        assert_eq!(super::save_dialog_filter("CAPTURE.ZIP"), ("ZIP", "zip"));
+        assert_eq!(super::save_dialog_filter("backup.sql"), ("SQL", "sql"));
+    }
+
     use super::run_with_database_restore_lock;
     use crate::services::sync_protocol::sync_mutex;
     use std::sync::atomic::{AtomicBool, Ordering};

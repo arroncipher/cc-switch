@@ -8,6 +8,7 @@ use crate::database::Database;
 use crate::provider::Provider;
 use crate::proxy::server::ProxyServer;
 use crate::proxy::switch_lock::SwitchLockManager;
+use crate::proxy::traffic_recorder::{TrafficExport, TrafficRecorder, TrafficRecordingConfig};
 use crate::proxy::types::*;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -18,6 +19,8 @@ use crate::live::project::claude::PROXY_TOKEN_PLACEHOLDER;
 
 #[derive(Clone)]
 pub struct ProxyService {
+    traffic_recorder: Arc<tokio::sync::OnceCell<Arc<TrafficRecorder>>>,
+    traffic_config_lock: Arc<tokio::sync::Mutex<()>>,
     db: Arc<Database>,
     server: Arc<RwLock<Option<ProxyServer>>>,
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
@@ -59,10 +62,71 @@ pub(crate) fn proxy_origin(host: &str, listen_port: u16) -> String {
 impl ProxyService {
     pub fn new(db: Arc<Database>) -> Self {
         Self {
+            traffic_recorder: Arc::new(tokio::sync::OnceCell::new()),
+            traffic_config_lock: Arc::new(tokio::sync::Mutex::new(())),
             db,
             server: Arc::new(RwLock::new(None)),
             app_handle: Arc::new(RwLock::new(None)),
             switch_locks: SwitchLockManager::new(),
+        }
+    }
+
+    async fn traffic_recorder(&self) -> Result<Arc<TrafficRecorder>, String> {
+        self.traffic_recorder
+            .get_or_try_init(|| async {
+                let config = crate::settings::get_settings().traffic_recording;
+                let recorder = match TrafficRecorder::open(config.clone()).await {
+                    Ok(recorder) => recorder,
+                    Err(error) => {
+                        log::warn!("Raw traffic recording unavailable: {error}");
+                        TrafficRecorder::open(TrafficRecordingConfig {
+                            enabled: false,
+                            ..config
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                    }
+                };
+                Ok::<_, String>(Arc::new(recorder))
+            })
+            .await
+            .cloned()
+    }
+
+    pub(crate) async fn configure_traffic_recording(
+        &self,
+        config: TrafficRecordingConfig,
+    ) -> Result<(), String> {
+        let _guard = self.traffic_config_lock.lock().await;
+        let previous = crate::settings::get_settings().traffic_recording;
+        let recorder = self.traffic_recorder().await?;
+        recorder
+            .reconfigure(config.clone())
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Err(error) = crate::settings::set_traffic_recording_config(config) {
+            let _ = recorder.reconfigure(previous).await;
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn export_traffic_recordings(
+        &self,
+        target: std::path::PathBuf,
+    ) -> Result<TrafficExport, String> {
+        self.traffic_recorder()
+            .await?
+            .export(target)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) async fn shutdown_traffic_recording(&self) {
+        if let Some(recorder) = self.traffic_recorder.get() {
+            if let Err(error) = recorder.shutdown().await {
+                log::warn!("Raw traffic recording shutdown incomplete: {error}");
+            }
         }
     }
 
@@ -137,7 +201,8 @@ impl ProxyService {
 
         // 4. 创建并启动服务器
         let app_handle = self.app_handle.read().await.clone();
-        let server = ProxyServer::new(config.clone(), self.db.clone(), app_handle);
+        let server = ProxyServer::new(config.clone(), self.db.clone(), app_handle)
+            .with_traffic_recorder(self.traffic_recorder().await?);
         let info = server
             .start()
             .await

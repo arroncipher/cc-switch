@@ -405,6 +405,8 @@ pub struct UsageDisplaySettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
+    #[serde(default)]
+    pub traffic_recording: crate::proxy::traffic_recorder::TrafficRecordingConfig,
     // ===== 设备级 UI 设置 =====
     #[serde(default = "default_show_in_tray")]
     pub show_in_tray: bool,
@@ -637,6 +639,7 @@ fn default_session_auto_sync_enabled() -> bool {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            traffic_recording: Default::default(),
             show_in_tray: true,
             minimize_to_tray_on_close: true,
             use_app_window_controls: false,
@@ -1069,6 +1072,12 @@ where
     save_settings_file(&next)?;
     *guard = next;
     Ok(())
+}
+
+pub(crate) fn set_traffic_recording_config(
+    config: crate::proxy::traffic_recorder::TrafficRecordingConfig,
+) -> Result<(), AppError> {
+    mutate_settings(|settings| settings.traffic_recording = config)
 }
 
 pub fn is_codex_third_party_history_provider_bucket_migrated() -> bool {

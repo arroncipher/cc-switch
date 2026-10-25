@@ -402,6 +402,18 @@
     }
   },
   "settings": {
+    "trafficRecording": {
+      "title": "生の通信記録",
+      "enabled": "リクエストとレスポンスを自動保存",
+      "description": "初期設定では無効です。プロキシを通過するリクエスト・レスポンス本文とSSEを元のバイト列のまま保存します。本文に実際に含まれるプロンプト、ツールデータ、ファイル、画像が対象です。ファイルパス、ファイルID、URLは参照のみを記録し、添付ファイルを別途コピー・ダウンロード・抽出しません。ヘッダーとURLの認証情報のみ伏せます。ログはこの端末に保存されます。空き容量は手動で管理してください。",
+      "defaultDirectory": "既定：CC Switchデータディレクトリ / raw-traffic",
+      "chooseDirectory": "フォルダーを選択",
+      "openDirectory": "フォルダーを開く",
+      "export": "ZIPをエクスポート",
+      "exported": "通信をエクスポートしました",
+      "exportSummary": "{{count}} 件のリクエスト、{{incomplete}} 件が未完了。",
+      "failed": "通信記録の操作に失敗しました"
+    },
     "title": "設定",
     "general": {
       "appearance": "外観",

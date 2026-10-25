@@ -596,18 +596,35 @@ mod tests {
             .await
             .unwrap();
         let endpoint = format!("http://127.0.0.1:{port}/auth/callback");
-        let old = client
-            .get(&endpoint)
-            .query(&[("state", "wrong"), ("code", "c")])
-            .send()
+        use http_body_util::BodyExt;
+        let socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(socket))
+                .await
+                .unwrap();
+        let connection = tokio::spawn(connection);
+        let request = http::Request::builder()
+            .uri("/auth/callback?state=wrong&code=c")
+            .header(http::header::HOST, format!("127.0.0.1:{port}"))
+            .body(http_body_util::Full::new(bytes::Bytes::new()))
+            .unwrap();
+        let old = sender.send_request(request).await.unwrap();
         assert_eq!(old.status(), StatusCode::BAD_REQUEST);
-        old.bytes().await.unwrap();
+        old.into_body().collect().await.unwrap();
         let response = manager
             .start_browser_flow_at_port(None, port, Duration::from_secs(LOGIN_LIFETIME))
             .await
             .unwrap();
+        // Observe closure directly, instead of racing reqwest's idle-pool reuse
+        // against the old server's FIN when sending the new login callback.
+        tokio::time::timeout(Duration::from_secs(2), connection)
+            .await
+            .expect("previous keep-alive connection closed")
+            .unwrap()
+            .unwrap();
+        assert!(sender.is_closed());
         let url = url::Url::parse(&response.verification_uri).unwrap();
         let state = url
             .query_pairs()
